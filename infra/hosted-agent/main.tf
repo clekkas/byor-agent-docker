@@ -3,6 +3,15 @@ locals {
   project_parent   = trimprefix(local.project_endpoint, "https://")
 }
 
+# NOTE -- first-time deploy vs. subsequent deploy of the SAME agent_name:
+#   import_existing_agent = false (the default): this agent_name has never been deployed before.
+#     Terraform creates it fresh. This is the correct setting for the very first apply.
+#   import_existing_agent = true: this agent_name already exists in Foundry (e.g. every apply
+#     after the first, or you're adopting an agent that was created some other way). Terraform
+#     imports it into state instead of trying to create a duplicate.
+# Set it wrong and you get a plan-time error, not a vague runtime failure -- see
+# variables.tf's import_existing_agent description for exactly which error each wrong setting
+# produces, so it's recognizable if you hit it.
 import {
   for_each = var.import_existing_agent ? toset([var.agent_name]) : toset([])
   to       = azapi_data_plane_resource.hosted_agent

@@ -44,6 +44,23 @@ variable "memory" {
 
 variable "import_existing_agent" {
   type        = bool
-  description = "Adopt the existing logical agent into Terraform state on the first apply."
-  default     = true
+  description = <<-EOT
+    Whether to import a PRE-EXISTING logical agent into Terraform state instead of creating a
+    new one.
+
+    Set this to false (the default) for a first-time deploy of a never-before-seen agent_name --
+    Terraform will create it. Set it to true only once the agent already exists in Foundry (e.g.
+    on every subsequent apply after the first, or when adopting an agent that was created outside
+    Terraform) -- Terraform will adopt it into state and manage new versions on top of it instead
+    of trying to recreate it.
+
+    Getting this backwards produces two different, easy-to-misdiagnose errors:
+      - true on a name that doesn't exist yet -> "Cannot import non-existent remote object"
+        (Terraform plan fails immediately, no resources touched).
+      - false on a name that already exists -> Terraform tries to create a duplicate and the
+        Foundry API rejects it (name collision), or -- depending on API behavior -- silently
+        creates an unrelated/orphaned second agent under the same name.
+  EOT
+  default     = false
 }
+
