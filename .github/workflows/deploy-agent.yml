@@ -1,19 +1,34 @@
-name: Deploy hosted agent (Foundry, anonymous self-hosted registry pull)
+name: Build, push, and deploy hosted agent (Foundry, anonymous self-hosted registry pull)
 
-# This workflow focuses on the Foundry deployment step: it takes an already-published image
-# digest on the self-hosted anonymous registry and deploys it as a Foundry hosted agent via
-# Terraform/AzAPI, with NO registry connection and NO OIDC token exchange configured. That
-# omission is the entire proof point of this repo -- see infra/hosted-agent/main.tf.
+# Proves a Microsoft Foundry hosted agent can pull its container image from a self-hosted,
+# UNAUTHENTICATED Docker Registry with NO Foundry registry connection and NO OIDC token exchange
+# configured -- see infra/hosted-agent/main.tf, whose container_configuration block omits
+# registry_connection_id entirely.
 #
-# Image build/push to the self-hosted registry is a separate, manual step (see README) since the
-# proof here is about the Foundry-side pull mechanism, not the image publishing pipeline.
+# The build job runs on a GitHub-hosted runner (pushes over plain HTTP to the anonymous registry).
+# The deploy job runs on a PRIVATE self-hosted runner (label: byor-private, VM:
+# byor-ci-docker-runner-01) because this repo's Terraform state lives in a storage account with
+# public network access disabled, reachable only via that runner's private endpoint -- the same
+# pattern byor-agent uses. This is a secondary, pragmatic choice (state-account network access),
+# unrelated to the actual proof point above.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - app.py
+      - knowledge/**
+      - requirements.txt
+      - Dockerfile
+      - infra/hosted-agent/**
+      - scripts/test-hosted-agent.py
+      - .github/workflows/deploy-agent.yml
   workflow_dispatch:
     inputs:
       image_digest:
-        description: "Full registry image reference with digest, e.g. byor-anon-registry.eastus.azurecontainer.io:5000/byor-agent-docker@sha256:..."
-        required: true
+        description: "Optional: deploy an existing registry image digest instead of building (leave empty to build)"
+        required: false
+        default: ""
 
 permissions:
   id-token: write
@@ -24,29 +39,83 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FOUNDRY_PROJECT_ENDPOINT: https://kaiser-foundry-resource.services.ai.azure.com/api/projects/workshop-demo-project
-  AZURE_TENANT_ID: 16b3c013-d300-468d-ac64-7eda0820b6d3
-  AZURE_SUBSCRIPTION_ID: 0e494a0c-e2e6-41f8-8a50-6064d842225e
-  AZURE_CLIENT_ID: a24802c6-4286-4572-8733-377837098a2d
-  STATE_RESOURCE_GROUP: kaiser-foundry-rg
-  STATE_STORAGE_ACCOUNT: byorproof76ot9wkv
-  STATE_CONTAINER: docker-registry-agent-tfstate
-  STATE_KEY: hosted-agent/proof.tfstate
   REGISTRY_HOST: byor-anon-registry.eastus.azurecontainer.io:5000
+  IMAGE_NAME: byor-agent-docker
 
 jobs:
+  build:
+    name: Build and push image to the self-hosted anonymous registry
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.digest.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use provided digest instead of building
+        if: inputs.image_digest != ''
+        run: echo "ok"
+
+      - name: Set up Docker Buildx (insecure registry allowed)
+        if: inputs.image_digest == ''
+        uses: docker/setup-buildx-action@v3
+        with:
+          config-inline: |
+            [registry."${{ env.REGISTRY_HOST }}"]
+              http = true
+              insecure = true
+
+      - name: Build and push (linux/amd64)
+        if: inputs.image_digest == ''
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+      - name: Smoke test pushed image
+        if: inputs.image_digest == ''
+        run: |
+          image="${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          cid=$(docker run -d --rm -p 8088:8088 "$image")
+          trap 'docker stop "$cid" >/dev/null 2>&1 || true' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8088/readiness >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://localhost:8088/readiness
+          curl -fsS -X POST http://localhost:8088/responses \
+            -H 'Content-Type: application/json' \
+            -d '{"input":"Foundry image smoke test"}' | tee /tmp/resp.json
+          python3 -c 'import json; r=json.load(open("/tmp/resp.json")); assert r["status"] == "completed" and r["output_text"], r'
+          docker stop "$cid" >/dev/null
+
+      - name: Resolve immutable image digest
+        id: digest
+        run: |
+          if [ -n "${{ inputs.image_digest }}" ]; then
+            echo "image=${{ inputs.image_digest }}" >> "$GITHUB_OUTPUT"
+            echo "Using provided digest: ${{ inputs.image_digest }}"
+          else
+            image="${{ env.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+            echo "Built and pushed: $image"
+          fi
+
   deploy:
     name: Terraform agent deploy (no registry connection)
-    runs-on: ubuntu-latest
+    needs: build
+    runs-on: [self-hosted, linux, byor-private]
     env:
-      ARM_CLIENT_ID: ${{ env.AZURE_CLIENT_ID }}
-      ARM_TENANT_ID: ${{ env.AZURE_TENANT_ID }}
-      ARM_SUBSCRIPTION_ID: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      ARM_CLIENT_ID: a24802c6-4286-4572-8733-377837098a2d
+      ARM_TENANT_ID: 16b3c013-d300-468d-ac64-7eda0820b6d3
+      ARM_SUBSCRIPTION_ID: 0e494a0c-e2e6-41f8-8a50-6064d842225e
       ARM_USE_OIDC: "true"
       TF_IN_AUTOMATION: "true"
-      TF_VAR_project_endpoint: ${{ env.FOUNDRY_PROJECT_ENDPOINT }}
+      TF_VAR_project_endpoint: https://kaiser-foundry-resource.services.ai.azure.com/api/projects/workshop-demo-project
       TF_VAR_agent_name: docker-registry-anon-agent
-      TF_VAR_image_uri: ${{ inputs.image_digest }}
+      TF_VAR_image_uri: ${{ needs.build.outputs.image }}
       TF_VAR_model_deployment_name: ""
       TF_VAR_cpu: "0.5"
       TF_VAR_memory: "1Gi"
@@ -62,9 +131,9 @@ jobs:
       - name: Azure login
         uses: azure/login@v2
         with:
-          client-id: ${{ env.AZURE_CLIENT_ID }}
-          tenant-id: ${{ env.AZURE_TENANT_ID }}
-          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+          client-id: a24802c6-4286-4572-8733-377837098a2d
+          tenant-id: 16b3c013-d300-468d-ac64-7eda0820b6d3
+          subscription-id: 0e494a0c-e2e6-41f8-8a50-6064d842225e
 
       - name: Validate inputs
         run: |
@@ -80,16 +149,16 @@ jobs:
 
       - name: Confirm registry is reachable anonymously (diagnostic only)
         run: |
-          curl -fsS "http://${{ env.REGISTRY_HOST }}/v2/" && echo "Anonymous /v2/ ping succeeded from the GitHub runner."
+          curl -fsS "http://${{ env.REGISTRY_HOST }}/v2/" && echo "Anonymous /v2/ ping succeeded from the private runner."
 
       - name: Terraform init (hosted-agent state)
         working-directory: infra/hosted-agent
         run: |
           terraform init -input=false \
-            -backend-config="resource_group_name=${{ env.STATE_RESOURCE_GROUP }}" \
-            -backend-config="storage_account_name=${{ env.STATE_STORAGE_ACCOUNT }}" \
-            -backend-config="container_name=${{ env.STATE_CONTAINER }}" \
-            -backend-config="key=${{ env.STATE_KEY }}" \
+            -backend-config="resource_group_name=kaiser-foundry-rg" \
+            -backend-config="storage_account_name=tfstateb173d2d85c34" \
+            -backend-config="container_name=docker-registry-agent-tfstate" \
+            -backend-config="key=hosted-agent/proof.tfstate" \
             -backend-config="use_azuread_auth=true"
 
       - name: Terraform plan (adopt agent and create candidate version)
