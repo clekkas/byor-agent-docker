@@ -49,8 +49,10 @@ env:
   REGISTRY_HOST: byor-anon-registry.eastus.azurecontainer.io
   IMAGE_NAME: byor-agent-docker
   # Used by scripts/test-hosted-agent.py's own az-identity auth (separate from Terraform's
-  # ARM_TENANT_ID below -- both happen to be the same tenant, but are read by different tools).
+  # ARM_* equivalents below -- both read the same values, but by different tool/env-var names).
   AZURE_TENANT_ID: 16b3c013-d300-468d-ac64-7eda0820b6d3
+  AZURE_SUBSCRIPTION_ID: 0e494a0c-e2e6-41f8-8a50-6064d842225e
+  AZURE_CLIENT_ID: a24802c6-4286-4572-8733-377837098a2d
 
 jobs:
   build:
