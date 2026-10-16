@@ -119,7 +119,7 @@ jobs:
       TF_VAR_model_deployment_name: ""
       TF_VAR_cpu: "0.5"
       TF_VAR_memory: "1Gi"
-      TF_VAR_import_existing_agent: "true"
+      TF_VAR_import_existing_agent: "false"
     steps:
       - uses: actions/checkout@v4
 
