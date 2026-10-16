@@ -17,20 +17,47 @@ this repo follows up on.
 
 A single, disposable `registry:2` container running on **Azure Container Instances (ACI)** —
 chosen deliberately over Azure Container Apps since Kaiser Permanente does not use Container Apps;
-this is test scaffolding, not an architecture recommendation.
+this is test scaffolding, not an architecture recommendation. A `caddy:2` sidecar in the same
+container group terminates TLS with a real Let's Encrypt certificate for the ACI FQDN and reverse
+proxies to the registry over localhost — **not** for security, but because Foundry's hosted-agent
+image-format validator rejects any registry reference with an explicit port
+(`host:port/repository`); see the "Gotcha" note below.
 
 ```
-http://byor-anon-registry.eastus.azurecontainer.io:5000
+https://byor-anon-registry.eastus.azurecontainer.io
 ```
 
-No authentication is configured at all. Verified anonymous:
+No authentication is configured at all on the registry itself. Verified anonymous:
 
 ```bash
-curl http://byor-anon-registry.eastus.azurecontainer.io:5000/v2/
+curl https://byor-anon-registry.eastus.azurecontainer.io/v2/
 # {}
-curl http://byor-anon-registry.eastus.azurecontainer.io:5000/v2/_catalog
+curl https://byor-anon-registry.eastus.azurecontainer.io/v2/_catalog
 # {"repositories":[]}
 ```
+
+## Gotcha: Foundry rejects `host:port` image references
+
+The registry's native listener is `registry:2`'s default port 5000, and the first version of this
+proof used `byor-anon-registry.eastus.azurecontainer.io:5000/...` directly as the image reference.
+`terraform apply` failed with:
+
+```
+RESPONSE 400: 400 Bad Request
+ERROR CODE: invalid_payload
+"message": "Must be a valid container image in the format '<registry>/<repository>[:<tag>|@<digest>]'."
+"param": "definition.container_configuration.image"
+```
+
+Direct testing against the Foundry agents API (same image string, with vs. without the `:5000`
+port, everything else identical) confirmed the port itself is what's rejected — not the hostname,
+not digest-vs-tag, not registry name length. Foundry's hosted-agent image validator apparently only
+accepts a bare registry host (standard port 443/HTTPS implied), not `host:port` syntax, even though
+`host:port/repo` is valid per the Docker/OCI reference grammar.
+
+Fix: put a TLS reverse proxy (Caddy, auto-provisioning its own Let's Encrypt cert for the ACI FQDN)
+in front of the registry on the standard HTTPS port, so the image reference never needs an explicit
+port. This is why the container group now runs two containers instead of one.
 
 ## Files
 
@@ -43,24 +70,13 @@ curl http://byor-anon-registry.eastus.azurecontainer.io:5000/v2/_catalog
 | `scripts/test-hosted-agent.py` | Waits for the new version to become active, verifies its image, and invokes its Responses endpoint |
 | `.github/workflows/deploy-agent.yml` | `workflow_dispatch`-only: takes an image digest, confirms the registry is reachable anonymously from the runner, deploys via Terraform, smoke-tests |
 
-## Push over plain HTTP (one-time Docker config)
+## Push over HTTPS
 
-The registry has no TLS certificate (it's a disposable test instance), so Docker needs to be told
-to treat this host as "insecure" (meaning: connect over plain HTTP, not "run less securely" in any
-other sense — there is nothing sensitive in this registry).
-
-**Docker Desktop:** Settings → Docker Engine → add to the JSON:
-
-```json
-{
-  "insecure-registries": ["byor-anon-registry.eastus.azurecontainer.io:5000"]
-}
-```
-
-Apply & Restart, then:
+The registry sits behind a real (Let's Encrypt) TLS certificate, so Docker's normal, secure
+registry client works unmodified — no `insecure-registries` config needed.
 
 ```bash
-export REGISTRY_HOST="byor-anon-registry.eastus.azurecontainer.io:5000"
+export REGISTRY_HOST="byor-anon-registry.eastus.azurecontainer.io"
 export IMAGE_TAG="0.1"
 ./build-and-push.sh
 ```
@@ -70,7 +86,7 @@ No `docker login` is needed or possible — the registry has no auth configured.
 The script prints the pushed image's immutable digest, e.g.:
 
 ```
-byor-anon-registry.eastus.azurecontainer.io:5000/byor-agent-docker@sha256:<64 hex chars>
+byor-anon-registry.eastus.azurecontainer.io/byor-agent-docker@sha256:<64 hex chars>
 ```
 
 ## Deploy to Foundry (the actual proof)
