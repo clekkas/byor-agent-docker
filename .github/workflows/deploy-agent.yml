@@ -1,0 +1,121 @@
+name: Deploy hosted agent (Foundry, anonymous self-hosted registry pull)
+
+# This workflow focuses on the Foundry deployment step: it takes an already-published image
+# digest on the self-hosted anonymous registry and deploys it as a Foundry hosted agent via
+# Terraform/AzAPI, with NO registry connection and NO OIDC token exchange configured. That
+# omission is the entire proof point of this repo -- see infra/hosted-agent/main.tf.
+#
+# Image build/push to the self-hosted registry is a separate, manual step (see README) since the
+# proof here is about the Foundry-side pull mechanism, not the image publishing pipeline.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Full registry image reference with digest, e.g. byor-anon-registry.eastus.azurecontainer.io:5000/byor-agent-docker@sha256:..."
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: docker-registry-hosted-agent-deployment
+  cancel-in-progress: false
+
+env:
+  FOUNDRY_PROJECT_ENDPOINT: https://kaiser-foundry-resource.services.ai.azure.com/api/projects/workshop-demo-project
+  AZURE_TENANT_ID: 16b3c013-d300-468d-ac64-7eda0820b6d3
+  AZURE_SUBSCRIPTION_ID: 0e494a0c-e2e6-41f8-8a50-6064d842225e
+  AZURE_CLIENT_ID: a24802c6-4286-4572-8733-377837098a2d
+  STATE_RESOURCE_GROUP: kaiser-foundry-rg
+  STATE_STORAGE_ACCOUNT: byorproof76ot9wkv
+  STATE_CONTAINER: docker-registry-agent-tfstate
+  STATE_KEY: hosted-agent/proof.tfstate
+  REGISTRY_HOST: byor-anon-registry.eastus.azurecontainer.io:5000
+
+jobs:
+  deploy:
+    name: Terraform agent deploy (no registry connection)
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ env.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ env.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "true"
+      TF_IN_AUTOMATION: "true"
+      TF_VAR_project_endpoint: ${{ env.FOUNDRY_PROJECT_ENDPOINT }}
+      TF_VAR_agent_name: docker-registry-anon-agent
+      TF_VAR_image_uri: ${{ inputs.image_digest }}
+      TF_VAR_model_deployment_name: ""
+      TF_VAR_cpu: "0.5"
+      TF_VAR_memory: "1Gi"
+      TF_VAR_import_existing_agent: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate inputs
+        run: |
+          case "$TF_VAR_image_uri" in
+            "${{ env.REGISTRY_HOST }}"/byor-agent-docker@sha256:*) ;;
+            *)
+              echo "::error::image_digest must be an immutable digest under ${{ env.REGISTRY_HOST }}/byor-agent-docker"
+              exit 1
+              ;;
+          esac
+          echo "Deploying image: $TF_VAR_image_uri"
+          echo "No registry_connection_id will be set -- see infra/hosted-agent/main.tf"
+
+      - name: Confirm registry is reachable anonymously (diagnostic only)
+        run: |
+          curl -fsS "http://${{ env.REGISTRY_HOST }}/v2/" && echo "Anonymous /v2/ ping succeeded from the GitHub runner."
+
+      - name: Terraform init (hosted-agent state)
+        working-directory: infra/hosted-agent
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ env.STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.STATE_CONTAINER }}" \
+            -backend-config="key=${{ env.STATE_KEY }}" \
+            -backend-config="use_azuread_auth=true"
+
+      - name: Terraform plan (adopt agent and create candidate version)
+        working-directory: infra/hosted-agent
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply hosted agent
+        working-directory: infra/hosted-agent
+        run: |
+          terraform apply -input=false tfplan
+          rm -f tfplan
+
+      - name: Capture candidate version
+        id: agent
+        working-directory: infra/hosted-agent
+        run: |
+          version="$(terraform output -raw agent_version)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Candidate version: $version"
+
+      - name: Wait for and smoke test candidate
+        run: |
+          python3 scripts/test-hosted-agent.py \
+            --endpoint "$TF_VAR_project_endpoint" \
+            --agent "$TF_VAR_agent_name" \
+            --version "${{ steps.agent.outputs.version }}" \
+            --expected-image "$TF_VAR_image_uri" \
+            --expected-model "$TF_VAR_model_deployment_name"
