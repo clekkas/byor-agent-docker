@@ -155,7 +155,7 @@ byor-anon-registry.eastus.azurecontainer.io/byor-agent-docker@sha256:<64 hex cha
 
 ## ⚠️ Important Notes
 
-- The registry (`byor-anon-registry.eastus.azurecontainer.io`) and its Caddy TLS proxy are **disposable test scaffolding on Azure Container Instances**, chosen deliberately over Azure Container Apps since Kaiser Permanente does not use that service — not an architecture recommendation.
+- The registry (`byor-anon-registry.eastus.azurecontainer.io`) and its Caddy TLS proxy are **disposable test scaffolding on Azure Container Instances**, chosen deliberately over Azure Container Apps since the client does not use that service — not an architecture recommendation.
 - This deploys to the shared, disposable `workshop-demo-project` Foundry project — **not** a production project.
 - Any registry endpoint exposed on a non-standard port needs a standard-port (443) front end before Foundry will accept the image reference — see [🧩 The Gotcha](#-the-gotcha-foundry-rejects-hostport-image-references).
 - Anonymous pull is a proof-of-concept pattern. For production JFrog workloads, OIDC token exchange via a registry connection (see `byor-agent`) remains the correct, auditable approach.

@@ -32,7 +32,7 @@ The registry itself is hosted on **Azure Container Instances (ACI)** purely as d
 scaffolding — a single, unauthenticated `registry:2` container with a public endpoint, plus a
 `caddy:2` sidecar in the same container group that terminates TLS with a real Let's Encrypt
 certificate and reverse-proxies to the registry over localhost — not as an architectural
-recommendation. Kaiser Permanente does not use Azure Container Apps, so ACI was chosen
+recommendation. The client does not use Azure Container Apps, so ACI was chosen
 deliberately as the simplest "just run one container" option with no implied platform preference.
 The TLS proxy exists only because Foundry's hosted-agent image validator rejects any image
 reference with an explicit registry port (`host:port/repository`) — see the main `README.md`'s
